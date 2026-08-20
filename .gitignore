@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor Directories
+.vscode/
+.idea/
+
+# LaTeX Auxiliary Build Files (Keeps .tex, .bib, and .pdf clean)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.run.xml
+*.bcf

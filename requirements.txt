@@ -1,0 +1,6 @@
+matplotlib==3.11.1
+numpy==2.5.2
+pandas==3.0.5
+pytest==9.1.1
+scipy==1.18.0
+yfinance==1.6.0

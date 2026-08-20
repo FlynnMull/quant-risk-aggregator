@@ -1,0 +1,1006 @@
+\documentclass{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{float}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\VaR}{VaR}
+\DeclareMathOperator{\ES}{ES}
+\DeclareMathOperator{\diag}{diag}
+
+\title{\textbf{Quantitative Risk Aggregator}}
+\author{
+    \textbf{Flynn Mulligan} \\
+    University of Bath \\
+    \small \texttt{flynn10@btinternet.com} \ / \ \texttt{fm822@bath.ac.uk}
+}
+\date{August 2026}
+
+\begin{document}
+
+\maketitle
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{Abstract}
+This paper presents the design, mathematical formulation and software architecture of a Quantitative Risk Management Aggregator constructed to compute tail-risk measures for heterogeneous, multi-asset portfolios containing both linear and non-linear instruments. Conventional risk infrastructures built around delta-normal Value-at-Risk (VaR) and low-order Taylor approximations of portfolio value are demonstrated to be structurally inadequate once a book contains material optionality, as the approximations misrepresent the convexity and asymmetry embedded in derivative payoffs, particularly in the tails of the return distribution where regulatory and economical capital decisions are made. In response, this work develops a full-revaluation Monte-Carlo engine simulating correlated multi-asset price paths via Cholesky factorised Gaussian innovations, applies variance reduction through antithetic sampling and revalues every position (regardless of linearity) under each simulated market state using closed form Black-Scholes-Merton pricing. From the resulting empirical portfolio-value distribution, the framework computes Value-at-Risk and Expected shortfall. The system is further extended with deterministic stress-testing capable of applying multi simultaneous multi-factor shocks (spot, volatility surface and interest rate) to assess portfolio fragility outside the estimated statistical distribution all together. We use a positive semi-definite correlation matrix repair mechanism to guarantee numerical validity of the covariance structure even when the inputs are internally inconsistent. Chapter 2 motivates this architecture by tracing the evolution of market risk practise from linear factor models toward the non-linear, multi-asset risk landscape of contemporary trading books, articulates the specific mathematical models under optionality and establishes coherent tail-risk measures. Subsequent chapters develop the simulation methodology, the pricing and Greeks calculations, the risk-measure estimations, stress-testing frameworks and the software used in technical detail.
+
+\section{Introduction \& Risk Management Motivation}
+
+\subsection{The Modern Market Risk Landscape}
+The discipline of market risk measurement has undergone a substantial transformation over the past three decades, driven jointly by the increasing structural complexity of trading books and by successive waves of regulatory reform following episodes of financial instability. In its earliest forms, market risk management was conducted almost entirely within a linear factor framework. Portfolio profit and loss (P\&L) was modelled as a weighted linear combination of underlying risk factor returns, a computationally tractable approach which is statistically convenient when portfolios are dominated by cash instruments and unlevered equities.
+
+This linear paradigm underpins the original RiskMetrics variance-covariance methodology and remains embedded in legacy risk systems. Its primary appeal lies in its analytical tractability: given an empirical factor covariance matrix and a vector of first-order position sensitivities, the distribution of portfolio P\&L can be characterised entirely by its first two moments under a joint normality assumption, permitting instantaneous computation of risk metrics without recourse to numerical simulation.
+
+Under the classical linear delta-normal framework, let $n$ denote the number of underlying risk factors. We define the vector of factor innovations over a discrete time horizon $\Delta t$ as $\Delta \mathbf{f} = (\Delta f_1, \Delta f_2, \dots, \Delta f_n)^\top \in \mathbb{R}^n$, which is assumed to follow a multivariate normal distribution:
+\begin{equation}
+    \Delta \mathbf{f} \sim \mathcal{N}(\boldsymbol{\mu}, \mathbf{\Sigma})
+\end{equation}
+where $\boldsymbol{\mu} \in \mathbb{R}^n$ represents the expected factor drift (conventionally set to $\mathbf{0}$ over short trading horizons) and $\mathbf{\Sigma} \in \mathbb{R}^{n \times n}$ is the symmetric, positive semi-definite factor covariance matrix.
+
+The portfolio's first-order sensitivity to these factors is governed by the gradient (Delta) vector $\boldsymbol{\delta} \in \mathbb{R}^n$, where each element corresponds to the partial derivative of total portfolio value $\Pi$ with respect to factor $i$:
+\begin{equation}
+    \boldsymbol{\delta} = \left( \frac{\partial \Pi}{\partial f_1}, \frac{\partial \Pi}{\partial f_2}, \dots, \frac{\partial \Pi}{\partial f_n} \right)^\top
+\end{equation}
+The change in total portfolio value $\Delta \Pi$ is then approximated as a linear inner product of the sensitivities and factor innovations:
+\begin{equation}
+    \Delta \Pi \approx \boldsymbol{\delta}^\top \Delta \mathbf{f} = \sum_{i=1}^n \delta_i \Delta f_i
+\end{equation}
+By the linear transformation properties of multivariate Gaussian variables, the resulting portfolio variance $\sigma_{\Pi}^2 = \Var(\Delta \Pi)$ is given by the quadratic form:
+\begin{equation}
+    \sigma_{\Pi}^2 = \Var(\boldsymbol{\delta}^\top \Delta \mathbf{f}) = \boldsymbol{\delta}^\top \mathbf{\Sigma} \boldsymbol{\delta}
+\end{equation}
+
+However, the composition of institutional trading books has shifted decisively away from the idealised conditions under which this first-order approximation remains valid. Modern institutional portfolios are characterised by:
+\begin{itemize}
+    \item \textbf{Multi-Asset Heterogeneity:} Books routinely combine cash equities, fixed income, foreign exchange, commodities, and derivative overlays referencing multiple imperfectly correlated underlyings simultaneously.
+    \item \textbf{Embedded Non-Linearity:} Options, structured products, and contingent-claim overlays introduce payoff functions that are convex or concave in the underlying risk factors, invalidating any static first-order representation of value sensitivity.
+    \item \textbf{Correlation Breakdown:} The dependence structure between assets is not static; empirical correlations across asset classes rise sharply during systemic market stress, precisely when risk measurement accuracy is most critical.
+    \item \textbf{Regulatory Evolution:} The transition under the Basel Committee on Banking Supervision (BCBS) from Value-at-Risk to Expected Shortfall standards under the Fundamental Review of the Trading Book (FRTB) reflects a supervisory mandate to capture tail risk and non-linearities accurately.
+    \item \textbf{Tail-Event Frequency:} Historical market crises have repeatedly demonstrated that asset returns exhibit heavy tails, volatility clustering, and jump discontinuities that a static, normally distributed factor model cannot capture.
+\end{itemize}
+
+It is this fundamental divergence between the analytical simplicity of linear factor models and the actual risk profile of option-embedded multi-asset books that motivates the full-revaluation architecture developed in this paper.
+
+\subsection{Limitations of Linear Risk Metrics}
+The delta-normal VaR methodology approximates the change in portfolio value using a first-order Taylor expansion of the pricing function with respect to the underlying risk factors. For instruments whose values are linear in the underlying factor, this expansion is exact. For derivative instruments with embedded optionality, however, the pricing function is non-linear, and truncating the Taylor series at first order discards higher-order terms that describe how sensitivity itself changes as the market evolves.
+
+Specifically, for a derivative instrument with valuation function $V(S, t)$, the first-order (delta-only) approximation of the price change $\Delta V = V(S + \Delta S) - V(S)$ under a spot shift $\Delta S$ is:
+\begin{equation}
+    \Delta V \approx \Delta \cdot \Delta S = \frac{\partial V}{\partial S} \Delta S
+\end{equation}
+where $\Delta = \partial V / \partial S$ denotes the local sensitivity evaluated at the base spot price $S$. This formulation assumes that sensitivity remains constant across the entire shock magnitude $\Delta S$, failing to account for \textit{delta drift} as the option transitions into or out of the money.
+
+To incorporate local curvature, practitioners often extend this representation to a second-order delta-gamma approximation:
+\begin{equation}
+    \Delta V \approx \Delta \cdot \Delta S + \frac{1}{2}\Gamma (\Delta S)^2
+\end{equation}
+where $\Gamma = \partial^2 V / \partial S^2$ denotes the option's gamma. Although the inclusion of $\frac{1}{2}\Gamma (\Delta S)^2$ captures local curvature, it remains an asymptotic expansion around the current operating point. It degrades significantly under large market dislocations, omits cross-gamma interaction terms across multi-asset books, and completely ignores sensitivities along orthogonal risk dimensions, including volatility shifts ($\mathcal{V}$) and calendar decay ($\Theta$).
+
+The economic intuition behind this failure is direct: a Taylor series is a local approximation valid in an infinitesimal neighbourhood of the initial state, whereas tail-risk metrics ($\VaR$ and $\ES$) evaluate extreme, non-local dislocations where polynomial truncations are least accurate. Several structural failure modes follow:
+\begin{itemize}
+    \item \textbf{Asymmetric Payoff Representation:} Long options exhibit bounded downside and unbounded convex upside—a profile that symmetric linear approximations cannot capture.
+    \item \textbf{Short Optionality / Gamma Risk:} Portfolios with net short gamma exposure experience accelerating losses as the underlying moves away from the strike, a dynamic omitted by linear models and only partially represented by second-order expansions.
+    \item \textbf{Volatility Surface Omission:} Linear models parameterised exclusively on spot factors omit Vega risk, failing to capture the mark-to-market losses that occur when implied volatility spikes during market crashes.
+    \item \textbf{Distributional Misspecification Under Aggregation:} Aggregating non-linear derivative exposures into a Gaussian distribution imposes artificial symmetry on P\&L profiles that are empirically skewed and fat-tailed.
+\end{itemize}
+
+To illustrate this failure concretely, consider a short position in an out-of-the-money European call option with strike $K$, spot price $S_0 < K$, and initial premium $V(S_0) > 0$. The terminal intrinsic payoff is $V(S) = \max(S - K, 0)$. Under a large upward spot shock $\Delta S > 0$ such that $S_0 + \Delta S > K$, the exact full-revaluation P\&L change of the short position $\Pi_{\text{short}} = -V(S)$ is:
+\begin{equation}
+    \Delta \Pi_{\text{exact}} = -\left[ V(S_0 + \Delta S) - V(S_0) \right] = -\left[ (S_0 + \Delta S - K) - V(S_0) \right]
+\end{equation}
+In contrast, the linear delta-normal approximation estimates the P\&L change solely via the initial out-of-the-money delta $\Delta_0 = \left.\frac{\partial V}{\partial S}\right|_{S_0} \in [0, 0.5)$:
+\begin{equation}
+    \Delta \Pi_{\text{linear}} = -\Delta_0 \cdot \Delta S
+\end{equation}
+Because the call option is strictly convex ($\Gamma = \partial^2 V / \partial S^2 > 0$), the short position carries negative gamma ($\Gamma_{\text{port}} < 0$). As the underlying rallies through the strike, the option's effective delta accelerates towards unity ($\Delta \to 1$), leading to a severe divergence where the true full-revaluation loss far exceeds the linear estimate:
+\begin{equation}
+    \Delta \Pi_{\text{exact}} < \Delta \Pi_{\text{linear}} \iff |\Delta \Pi_{\text{exact}}| > |\Delta \Pi_{\text{linear}}|
+\end{equation}
+This systematic underestimation of short-gamma tail losses highlights why sensitivity proxies are structurally inadequate for non-linear portfolios, establishing the necessity of a full-revaluation engine.
+
+\subsection{The Necessity of Coherent Tail-Risk Measures}
+Beyond exact portfolio revaluation, a robust risk architecture requires a mathematically sound functional to summarize the tail of the resulting loss distribution. Let $(\Omega, \mathcal{F}, \mathbb{P})$ be a probability space and let $L = -\Delta \Pi$ denote the portfolio loss random variable over horizon $\Delta t$, with cumulative distribution function $F_L(l) = \mathbb{P}(L \le l)$.
+
+For a specified confidence level $\alpha \in (0, 1)$ (e.g., $\alpha = 0.95$ or $\alpha = 0.99$), Value-at-Risk ($\VaR_\alpha$) is defined as the generalised inverse CDF ($\alpha$-quantile) of the loss distribution:
+\begin{equation}
+    \VaR_\alpha(L) = \inf \{ l \in \mathbb{R} : \mathbb{P}(L \le l) \ge \alpha \} = F_L^{-1}(\alpha)
+\end{equation}
+Economically, $\VaR_\alpha(L)$ represents the minimum loss threshold that will not be exceeded with probability $\alpha$. However, $\VaR$ is entirely blind to the magnitude of losses conditional on exceeding this threshold.
+
+To resolve this limitation, Expected Shortfall ($\ES_\alpha$) is defined as the conditional expectation of loss given that the loss equals or exceeds the $\VaR_\alpha$ quantile:
+\begin{equation}
+    \ES_\alpha(L) = \mathbb{E}[L \mid L \ge \VaR_\alpha(L)]
+\end{equation}
+For a continuous loss distribution, $\ES_\alpha(L)$ can be equivalently expressed in integral form as the uniform average of all tail quantiles at or above confidence level $\alpha$:
+\begin{equation}
+    \ES_\alpha(L) = \frac{1}{1 - \alpha} \int_\alpha^1 \VaR_u(L) \, du
+\end{equation}
+This integral formulation confirms that $\ES_\alpha$ reflects the entire tail geometry, ensuring that $\ES_\alpha(L) \ge \VaR_\alpha(L)$ for any non-degenerate distribution.
+
+Formally, let $\mathcal{X}$ denote the linear space of real-valued random variables representing portfolio terminal outcomes on $(\Omega, \mathcal{F}, \mathbb{P})$. Following Artzner et al. (1999), a functional $\rho: \mathcal{X} \to \mathbb{R}$ is defined as a \textbf{coherent risk measure} if and only if it satisfies four foundational axioms for all $X, Y \in \mathcal{X}$:
+\begin{enumerate}
+    \item \textbf{Monotonicity:} If $X \le Y$ $\mathbb{P}$-a.s., then $\rho(X) \ge \rho(Y)$.
+    \begin{equation}
+        X \le Y \quad \mathbb{P}\text{-a.s.} \implies \rho(X) \ge \rho(Y)
+    \end{equation}
+    \item \textbf{Sub-additivity:} The risk of an aggregated portfolio cannot exceed the sum of individual component risks, ensuring diversification is never penalised:
+    \begin{equation}
+        \rho(X + Y) \le \rho(X) + \rho(Y)
+    \end{equation}
+    \item \textbf{Positive Homogeneity:} Scaling a position by a deterministic factor $\lambda \ge 0$ scales the capital requirement proportionally:
+    \begin{equation}
+        \rho(\lambda X) = \lambda \rho(X), \quad \forall \lambda \ge 0
+    \end{equation}
+    \item \textbf{Translation Invariance:} Adding a guaranteed cash amount $c \in \mathbb{R}$ reduces the required risk capital by exactly $c$:
+    \begin{equation}
+        \rho(X + c) = \rho(X) - c, \quad \forall c \in \mathbb{R}
+    \end{equation}
+\end{enumerate}
+
+Sub-additivity is of paramount economic importance: it formalises the principle that portfolio pooling and diversification should never increase capital requirements. Value-at-Risk violates sub-additivity under fat-tailed or asymmetric distributions.
+
+To illustrate this failure, consider two independent, defaultable credit instruments with loss variables $L_1$ and $L_2$. Let each instrument have an independent default probability $p = 0.04$ with a loss severity of \$100:
+\begin{equation}
+    L_1, L_2 \sim \begin{cases} \$100 & \text{with probability } p = 0.04 \\ \$0 & \text{with probability } 1 - p = 0.96 \end{cases}
+\end{equation}
+Evaluating individual $\VaR$ at the $\alpha = 0.95$ confidence level:
+\begin{equation}
+    \mathbb{P}(L_i \le 0) = 0.96 \ge 0.95 \implies \VaR_{0.95}(L_1) = \$0, \quad \VaR_{0.95}(L_2) = \$0
+\end{equation}
+The sum of standalone capital requirements is therefore:
+\begin{equation}
+    \VaR_{0.95}(L_1) + \VaR_{0.95}(L_2) = \$0 + \$0 = \$0
+\end{equation}
+
+Now consider the aggregated portfolio loss $L_{\text{port}} = L_1 + L_2$. By statistical independence, the joint distribution is:
+\begin{equation}
+    L_{\text{port}} = \begin{cases} 
+        \$0 & \text{with probability } (0.96)^2 = 0.9216 \\ 
+        \$100 & \text{with probability } 2 \times (0.04 \times 0.96) = 0.0768 \\ 
+        \$200 & \text{with probability } (0.04)^2 = 0.0016 
+    \end{cases}
+\end{equation}
+Because $\mathbb{P}(L_{\text{port}} \le 0) = 0.9216 < 0.95$, while $\mathbb{P}(L_{\text{port}} \le 100) = 0.9216 + 0.0768 = 0.9984 \ge 0.95$, the portfolio Value-at-Risk is:
+\begin{equation}
+    \VaR_{0.95}(L_1 + L_2) = \$100
+\end{equation}
+Comparing the joint risk to the standalone components reveals a direct violation of sub-additivity:
+\begin{equation}
+    \VaR_{0.95}(L_1 + L_2) = \$100 > \$0 = \VaR_{0.95}(L_1) + \VaR_{0.95}(L_2)
+\end{equation}
+This confirms that $\VaR$ can penalise diversification, whereas Expected Shortfall ($\ES_\alpha$) remains provably sub-additive and coherent under all distributions.
+
+\subsection{Project Objectives and System Scope}
+To overcome the twin limitations of linear valuation proxies and non-coherent risk metrics, this research develops a production-grade risk aggregation architecture structured around six core objectives:
+
+\textbf{Objective 1 — Full-Revaluation Monte Carlo Simulation Engine:} Simulates correlated terminal price paths for $N$ underlying assets under a multi-asset Geometric Brownian Motion (GBM) specification. Correlation is imposed on independent Gaussian draws via Cholesky factorisation $\mathbf{\Sigma} = \mathbf{L}\mathbf{L}^\top$:
+\begin{equation}
+    \mathbf{Z} = \mathbf{L}\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{\Sigma}), \quad \boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}_N)
+\end{equation}
+Terminal prices for each asset $i \in \{1, \dots, N\}$ at horizon $T$ are evaluated exactly as:
+\begin{equation}
+    S_{i, T} = S_{i, 0} \exp\left( \left(r - q_i - \frac{1}{2}\sigma_i^2\right)T + \sigma_i \sqrt{T} Z_i \right)
+\end{equation}
+where $\mathbf{S}_0 \in \mathbb{R}^N$ is the spot vector, $r$ is the risk-free rate, $\mathbf{q} \in \mathbb{R}^N$ is the continuous dividend yield vector, and $\boldsymbol{\sigma} \in \mathbb{R}^N$ is the volatility vector.
+
+\textbf{Objective 2 — Variance Reduction via Antithetic Sampling:} Pairs each simulated Gaussian innovation vector $\mathbf{Z}^{(m)}$ with its negative counterpart $-\mathbf{Z}^{(m)}$ across $M$ independent pairs (total $2M$ paths). The paired-sample estimator:
+\begin{equation}
+    Y^{(m)} = \frac{g(\mathbf{Z}^{(m)}) + g(-\mathbf{Z}^{(m)})}{2}
+\end{equation}
+yields the global estimator $\hat{\mu}_{\text{anti}} = \frac{1}{M}\sum_{m=1}^M Y^{(m)}$. For any coordinate-wise monotonic valuation kernel $g(\cdot)$, $\Cov(g(\mathbf{Z}), g(-\mathbf{Z})) \le 0$, ensuring:
+\begin{equation}
+    \Var(\hat{\mu}_{\text{anti}}) = \frac{\sigma_g^2 + \Cov(g(\mathbf{Z}), g(-\mathbf{Z}))}{2M} \le \frac{\sigma_g^2}{2M} = \Var(\hat{\mu}_{\text{iid}})
+\end{equation}
+
+\textbf{Objective 3 — Exact Multi-Instrument Revaluation:} Reprices every linear and derivative position in the portfolio under each simulated terminal state using closed-form analytical formulas:
+\begin{equation}
+    V_k(S, \tau; \boldsymbol{\theta}_k) = \begin{cases} S & \text{for linear equities} \\ V_{\text{BSM}}(S, K_k, \tau, r, q_i, \sigma_i; \phi_k) & \text{for European options} \end{cases}
+\end{equation}
+The revaluation matrix $\mathbf{V}(\mathbf{S}_T) \in \mathbb{R}^{M \times K}$ is contracted with position weights $\mathbf{w} \in \mathbb{R}^K$ to evaluate terminal portfolio values $\boldsymbol{\Pi}_T = \mathbf{V}(\mathbf{S}_T)\mathbf{w}$ and loss vectors $\mathbf{L} = -(\boldsymbol{\Pi}_T - \Pi_0 \mathbf{1}_M)$ without loop iteration.
+
+\textbf{Objective 4 — Empirical Coherent Risk Measure Estimation:} Given sorted order statistics of the loss vector $L_{(1)} \le L_{(2)} \le \dots \le L_{(M)}$, computes empirical $\widehat{\VaR}_\alpha$ and $\widehat{\ES}_\alpha$:
+\begin{align}
+    \widehat{\VaR}_\alpha(L) &= L_{(\lceil M\alpha \rceil)} \\
+    \widehat{\ES}_\alpha(L) &= \frac{1}{M(1 - \alpha)} \sum_{m=\lceil M\alpha \rceil}^M L_{(m)}
+\end{align}
+with standard error estimators $\text{SE}(\hat{\mu}) = s_L / \sqrt{M}$ and $\text{SE}(\widehat{\ES}_\alpha) \approx s_{\text{tail}} / \sqrt{M(1-\alpha)}$ confirming $\mathcal{O}(M^{-1/2})$ convergence.
+
+\textbf{Objective 5 — Robust Market Data Ingestion and Correlation Matrix Repair:} Projects empirical non-positive semi-definite correlation matrices $\mathbf{\Sigma}$ onto the valid PSD cone via Higham spectral clipping:
+\begin{equation}
+    \mathbf{\Sigma} = \mathbf{Q}\mathbf{\Lambda}\mathbf{Q}^\top \implies \widetilde{\mathbf{\Sigma}} = \mathbf{Q} \diag(\max(\lambda_i, \epsilon)) \mathbf{Q}^\top
+\end{equation}
+followed by diagonal normalization $\mathbf{\Sigma}_{\text{PSD}} = \mathbf{D}^{-1/2}\widetilde{\mathbf{\Sigma}}\mathbf{D}^{-1/2}$ where $\mathbf{D} = \diag(\widetilde{\mathbf{\Sigma}})$, guaranteeing unit diagonal entries and valid Cholesky factorization $\mathbf{\Sigma}_{\text{PSD}} = \mathbf{L}\mathbf{L}^\top$.
+
+\textbf{Objective 6 — Deterministic Macro Stress-Testing Framework:} Re-evaluates the exact valuation kernel under deterministic multi-factor shock tuples $\Delta \mathcal{M}^{(s)} = (\Delta \mathbf{s}_{\text{shock}}^{(s)}, \Delta \boldsymbol{\sigma}_{\text{shock}}^{(s)}, \Delta r_{\text{shock}}^{(s)})$, calculating full-revaluation portfolio drawdowns and Greek deformation vectors:
+\begin{align}
+    \Delta \Pi_{\text{stress}}^{(s)} &= \Pi_{\text{stressed}}^{(s)} - \Pi_{\text{base}} \\
+    \Delta \boldsymbol{\Phi}_{\text{port}}^{(s)} &= \boldsymbol{\Phi}_{\text{stressed}}^{(s)} - \boldsymbol{\Phi}_{\text{base}}, \quad \boldsymbol{\Phi} \in \{ \boldsymbol{\Delta}_{\text{port}}, \mathbf{\Gamma}_{\text{port}}, \boldsymbol{\mathcal{V}}_{\text{port}} \}
+\end{align}
+characterizing dynamic hedging breakdown and delta drift during extreme market dislocations.
+
+\section{Theoretical \& Mathematical Framework}
+
+\subsection{Continuous-Time Stochastic Dynamics \& Measure Theory}
+
+\subsubsection{The Filtered Probability Space and Change of Measure}
+We work on a complete filtered probability space $(\Omega, \mathcal{F}, (\mathcal{F}_t)_{t \ge 0}, \mathbb{P})$ satisfying the usual conditions (right-continuity of the filtration $(\mathcal{F}_t)_{t \ge 0}$ and $\mathbb{P}$-completeness of $\mathcal{F}_0$). Here $\mathbb{P}$ denotes the physical (historical) probability measure under which asset return statistics are calibrated, and $(\mathcal{F}_t)_{t \ge 0}$ represents the natural filtration generated by an $N$-dimensional Brownian motion $W^\mathbb{P}(t) = (W_1^\mathbb{P}(t), \dots, W_N^\mathbb{P}(t))^\top$, augmented to satisfy completeness.
+
+To guarantee arbitrage-free pricing across the derivative overlays in the book, the First Fundamental Theorem of Asset Pricing mandates the existence of an equivalent martingale measure $\mathbb{Q} \sim \mathbb{P}$ under which all discounted asset price processes are $\mathbb{Q}$-martingales.
+
+\begin{theorem}[Cameron--Martin--Girsanov]
+Let $W^{\mathbb{P}}(t)$ be an $N$-dimensional $\mathbb{P}$-Brownian motion on $[0, T]$ and let $\theta(t) = (\theta_1(t), \dots, \theta_N(t))^\top$ be an $(\mathcal{F}_t)$-adapted vector process (the market price of risk) satisfying Novikov's condition:
+\begin{equation}
+\mathbb{E}^\mathbb{P}\left[\exp\left(\frac{1}{2}\int_0^T \|\theta(t)\|^2\,dt\right)\right] < \infty.
+\end{equation}
+Define the Radon--Nikod\'ym derivative process $\Lambda(t) := \left.\frac{d\mathbb{Q}}{d\mathbb{P}}\right|_{\mathcal{F}_t}$ by:
+\begin{equation}
+\Lambda(t) = \exp\left(-\int_0^t \theta(s)^\top dW^{\mathbb{P}}(s) - \frac{1}{2}\int_0^t \|\theta(s)\|^2\,ds\right).
+\end{equation}
+Then $\Lambda(t)$ is a true $\mathbb{P}$-martingale, the measure $\mathbb{Q}$ defined by $\mathbb{Q}(A) = \mathbb{E}^\mathbb{P}[\Lambda(T)\mathbf{1}_A]$ for all $A \in \mathcal{F}_T$ is a probability measure equivalent to $\mathbb{P}$, and the shifted process
+\begin{equation}
+W^{\mathbb{Q}}(t) := W^{\mathbb{P}}(t) + \int_0^t \theta(s)\,ds
+\end{equation}
+is an $N$-dimensional standard Brownian motion under $\mathbb{Q}$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Martingality of $\Lambda(t)$ follows directly from Novikov's condition, which prevents explosion of the stochastic exponential and ensures $\mathbb{E}^\mathbb{P}[\Lambda(T)] = 1$, rendering $\mathbb{Q}$ a valid probability measure. Applying It\^o's product rule to the process $\Lambda(t)Y(t)$ for an arbitrary $\mathbb{P}$-martingale $Y(t)$ gives:
+\begin{equation}
+d(\Lambda(t)Y(t)) = \Lambda(t)\,dY(t) + Y(t)\,d\Lambda(t) + d\langle \Lambda, Y \rangle_t.
+\end{equation}
+Using $d\Lambda(t) = -\Lambda(t)\theta(t)^\top dW^{\mathbb{P}}(t)$, one verifies that $\Lambda(t)\left(Y(t) - Y(0) - \langle Y, \theta^\top W^\mathbb{P} \rangle_t\right)$ is a local $\mathbb{P}$-martingale. By the generalised Bayes' formula for conditional expectations under an equivalent measure, $Y(t) - \int_0^t \theta(s)^\top d\langle Y, W^\mathbb{P}\rangle_s$ is a $\mathbb{Q}$-martingale. Setting $Y(t) = W_i^\mathbb{P}(t)$ component-wise yields:
+\begin{equation}
+W_i^\mathbb{Q}(t) = W_i^\mathbb{P}(t) + \int_0^t \theta_i(s)\,ds.
+\end{equation}
+Since $W_i^\mathbb{Q}(t)$ is a continuous local $\mathbb{Q}$-martingale with deterministic quadratic variation $\langle W_i^\mathbb{Q}\rangle_t = t$, L\'evy's characterisation theorem confirms that $W^\mathbb{Q}(t)$ is an $N$-dimensional standard Brownian motion under $\mathbb{Q}$.
+\end{proof}
+
+Under constant risk-free rate $r$, continuous dividend yield $q_i$, and volatility $\sigma_i$, the asset drift under $\mathbb{P}$ is $\mu_i$, yielding the market price of risk $\theta_i = (\mu_i - r + q_i)/\sigma_i$. Under $\mathbb{Q}$, each discounted dividend-reinvested asset price $e^{-(r - q_i)t}S_i(t)$ is a $\mathbb{Q}$-martingale.
+
+\subsubsection{The Coupled SDE System for \texorpdfstring{$N$}{N} Dividend-Paying Assets}
+Under $\mathbb{Q}$, the vector of asset prices $S(t) = (S_1(t), \dots, S_N(t))^\top$ follows the coupled system of stochastic differential equations:
+\begin{equation}
+dS_i(t) = (r - q_i)S_i(t)\,dt + \sigma_i S_i(t)\,dW_i^{\mathbb{Q}}(t), \quad i = 1, \dots, N,
+\end{equation}
+where the driving Brownian motions satisfy the instantaneous quadratic covariation:
+\begin{equation}
+d\langle W_i^{\mathbb{Q}}, W_j^{\mathbb{Q}}\rangle_t = \rho_{ij}\,dt, \quad \rho_{ii} = 1,
+\end{equation}
+with the correlation matrix $\mathbf{P} = (\rho_{ij})_{i,j=1}^N$ being symmetric positive semi-definite. Formally, over partitions $\pi = \{0 = t_0 < t_1 < \dots < t_m = t\}$ with mesh size $\|\pi\| \to 0$:
+\begin{equation}
+\lim_{\|\pi\|\to 0}\sum_{k=0}^{m-1}\left(W_i^{\mathbb{Q}}(t_{k+1})-W_i^{\mathbb{Q}}(t_k)\right)\left(W_j^{\mathbb{Q}}(t_{k+1})-W_j^{\mathbb{Q}}(t_k)\right) = \rho_{ij}t \quad \text{a.s.}
+\end{equation}
+
+\subsubsection{It\^o's Lemma and Exact Log-Normal Terminal Distribution}
+\begin{proposition}[Log-Price Dynamics]
+Let $X_i(t) := \ln S_i(t)$. Then $X_i(t)$ satisfies:
+\begin{equation}
+dX_i(t) = \left(r - q_i - \frac{1}{2}\sigma_i^2\right)dt + \sigma_i\,dW_i^{\mathbb{Q}}(t),
+\end{equation}
+and the exact terminal price admits the closed-form law:
+\begin{equation}
+S_i(T) = S_i(0)\exp\left(\left(r - q_i - \frac{1}{2}\sigma_i^2\right)T + \sigma_i W_i^{\mathbb{Q}}(T)\right).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Consider the scalar function $f(x) = \ln x$, which is $\mathcal{C}^2$ on $(0, \infty)$ with derivatives $f'(x) = 1/x$ and $f''(x) = -1/x^2$. Applying It\^o's formula to $X_i(t) = f(S_i(t))$:
+\begin{align}
+dX_i(t) &= f'(S_i(t))\,dS_i(t) + \frac{1}{2}f''(S_i(t))\,d\langle S_i \rangle_t \nonumber \\
+&= \frac{1}{S_i(t)}\left[(r - q_i)S_i(t)\,dt + \sigma_i S_i(t)\,dW_i^{\mathbb{Q}}(t)\right] - \frac{1}{2S_i(t)^2}\left(\sigma_i^2 S_i(t)^2\,dt\right) \nonumber \\
+&= \left(r - q_i - \frac{1}{2}\sigma_i^2\right)dt + \sigma_i\,dW_i^{\mathbb{Q}}(t).
+\end{align}
+Integrating both sides from $0$ to $T$:
+\begin{equation}
+X_i(T) - X_i(0) = \left(r - q_i - \frac{1}{2}\sigma_i^2\right)T + \sigma_i\left(W_i^{\mathbb{Q}}(T) - W_i^{\mathbb{Q}}(0)\right).
+\end{equation}
+Using $W_i^{\mathbb{Q}}(0) = 0$ and exponentiating gives the terminal price formula. Because $W_i^\mathbb{Q}(T) \sim \mathcal{N}(0, T)$, $X_i(T)$ is normally distributed, and $S_i(T)$ follows a log-normal distribution with probability density:
+\begin{equation}
+f_{S_i(T)}(s) = \frac{1}{s\sigma_i\sqrt{2\pi T}}\exp\left(-\frac{\left[\ln(s/S_i(0)) - (r - q_i - \frac{1}{2}\sigma_i^2)T\right]^2}{2\sigma_i^2 T}\right), \quad s > 0.
+\end{equation}
+\end{proof}
+
+\subsection{Multivariate Dependence, Cholesky Factorisation, and PSD Repair}
+
+\subsubsection{Cholesky Factorisation and the Correlated Shock Transform}
+Let $\Sigma \in \mathbb{R}^{N \times N}$ be a symmetric positive-definite covariance matrix. By the Cholesky decomposition theorem, there exists a unique lower-triangular matrix $L \in \mathbb{R}^{N \times N}$ with strictly positive diagonal entries ($L_{ii} > 0$) such that:
+\begin{equation}
+\Sigma = L L^\top.
+\end{equation}
+The elements of $L$ are computed recursively via the Cholesky--Banachiewicz algorithm:
+\begin{align}
+L_{ii} &= \sqrt{\Sigma_{ii} - \sum_{k=1}^{i-1} L_{ik}^2}, \\
+L_{ij} &= \frac{1}{L_{jj}}\left(\Sigma_{ij} - \sum_{k=1}^{j-1} L_{ik}L_{jk}\right), \quad j < i.
+\end{align}
+Given an independent standard normal vector $\epsilon \sim \mathcal{N}(0, I_N)$, the linear transform
+\begin{equation}
+Z = L\epsilon
+\end{equation}
+generates the correlated Gaussian innovation vector $Z \sim \mathcal{N}(0, \Sigma)$.
+
+\begin{proof}
+Because affine transformations of Gaussian vectors remain Gaussian, $\mathbb{E}[Z] = L\mathbb{E}[\epsilon] = 0$. For the covariance:
+\begin{equation}
+\mathbb{E}[ZZ^\top] = \mathbb{E}[(L\epsilon)(L\epsilon)^\top] = L\mathbb{E}[\epsilon\epsilon^\top]L^\top = L I_N L^\top = L L^\top = \Sigma.
+\end{equation}
+Since a multivariate normal distribution is uniquely determined by its mean and covariance matrix, $Z \sim \mathcal{N}(0, \Sigma)$.
+\end{proof}
+
+\subsubsection{Positive Semi-Definite Repair via Spectral Projection}
+Empirical covariance matrices derived from asynchronous historical returns often possess negative eigenvalues ($\lambda_{\min}(\Sigma) < 0$). We map indefinite empirical matrices onto the valid cone of PSD matrices $\mathcal{S}_+^N$ using spectral projection.
+
+\begin{proposition}[Spectral PSD Projection and Diagonal Normalisation]
+Let $\Sigma = Q\Lambda Q^\top$ be the orthogonal eigendecomposition of an empirical symmetric matrix. Define the thresholded eigenvalue matrix $\tilde{\Lambda} = \operatorname{diag}(\max(\lambda_i, \epsilon_{\text{floor}}))$ with $\epsilon_{\text{floor}} > 0$, form the intermediate matrix $\tilde{\Sigma} = Q\tilde{\Lambda}Q^\top$, and apply the diagonal scaling matrix $D = \operatorname{diag}(\tilde{\Sigma})$. Then
+\begin{equation}
+\Sigma^* = D^{-1/2}\tilde{\Sigma}D^{-1/2}
+\end{equation}
+is symmetric positive-definite with $\Sigma_{ii}^* = 1$ for all $i \in \{1, \dots, N\}$.
+\end{proposition}
+
+\begin{proof}
+Symmetry holds because $\tilde{\Sigma}$ is symmetric and $D^{-1/2}$ is diagonal: $(\Sigma^*)^\top = (D^{-1/2}\tilde{\Sigma}D^{-1/2})^\top = D^{-1/2}\tilde{\Sigma}D^{-1/2} = \Sigma^*$. Positive definiteness is preserved under congruence: for any $x \in \mathbb{R}^N \setminus \{0\}$, defining $y = D^{-1/2}x \ne 0$ yields:
+\begin{equation}
+x^\top \Sigma^* x = x^\top (D^{-1/2}\tilde{\Sigma}D^{-1/2})x = y^\top \tilde{\Sigma} y > 0,
+\end{equation}
+since all eigenvalues in $\tilde{\Lambda}$ satisfy $\tilde{\lambda}_i \ge \epsilon_{\text{floor}} > 0$. Finally, evaluating the diagonal entries yields $\Sigma_{ii}^* = D_{ii}^{-1/2}\tilde{\Sigma}_{ii}D_{ii}^{-1/2} = \tilde{\Sigma}_{ii}/\tilde{\Sigma}_{ii} = 1$.
+\end{proof}
+
+\subsection{The Black--Scholes--Merton PDE and Analytical Greeks Engine}
+
+\subsubsection{Derivation of the Merton Continuous Dividend PDE}
+Consider a derivative contract with pricing function $V(S, t)$ written on an asset paying a continuous dividend yield $q$. Construct a self-financing portfolio $\Pi(t)$ long one unit of the derivative and short $\Delta$ shares of the underlying:
+\begin{equation}
+\Pi(t) = V(S, t) - \Delta S(t).
+\end{equation}
+Applying It\^o's lemma to $V(S,t)$ under the physical dynamics $dS = \mu S\,dt + \sigma S\,dW^\mathbb{P}$:
+\begin{equation}
+dV = \left(\frac{\partial V}{\partial t} + \mu S\frac{\partial V}{\partial S} + \frac{1}{2}\sigma^2 S^2\frac{\partial^2 V}{\partial S^2}\right)dt + \sigma S\frac{\partial V}{\partial S}\,dW^\mathbb{P}.
+\end{equation}
+Accounting for the dividend cash flow accrued on the short holding ($-\Delta qS\,dt$), the portfolio differential is:
+\begin{equation}
+d\Pi = dV - \Delta\,dS - \Delta q S\,dt = \left(\frac{\partial V}{\partial t} + \frac{1}{2}\sigma^2 S^2\frac{\partial^2 V}{\partial S^2} - \Delta q S + (\mu S - \Delta \mu S)\frac{\partial V}{\partial S}\right)dt + \sigma S\left(\frac{\partial V}{\partial S} - \Delta\right)dW^\mathbb{P}.
+\end{equation}
+Setting $\Delta = \frac{\partial V}{\partial S}$ eliminates the stochastic diffusion term $dW^\mathbb{P}$, making the portfolio locally riskless:
+\begin{equation}
+d\Pi = \left(\frac{\partial V}{\partial t} + \frac{1}{2}\sigma^2 S^2\frac{\partial^2 V}{\partial S^2} - q S\frac{\partial V}{\partial S}\right)dt.
+\end{equation}
+By the no-arbitrage principle, the instantaneous return on the hedged portfolio must match the risk-free rate: $d\Pi = r\Pi\,dt = r\left(V - S\frac{\partial V}{\partial S}\right)dt$. Equating terms yields the Merton (1973) PDE:
+\begin{equation}
+\frac{\partial V}{\partial t} + (r - q)S\frac{\partial V}{\partial S} + \frac{1}{2}\sigma^2 S^2\frac{\partial^2 V}{\partial S^2} - rV = 0.
+\end{equation}
+
+\subsubsection{Closed-Form European Option Prices}
+Solving the PDE subject to the boundary conditions at maturity $\tau = T - t$ yields the standard pricing equations:
+\begin{align}
+C(S, K, \tau, r, q, \sigma) &= S e^{-q\tau}\Phi(d_1) - K e^{-r\tau}\Phi(d_2), \\
+P(S, K, \tau, r, q, \sigma) &= K e^{-r\tau}\Phi(-d_2) - S e^{-q\tau}\Phi(-d_1),
+\end{align}
+where $\Phi(\cdot)$ and $\phi(\cdot)$ denote the standard normal cumulative distribution and probability density functions, respectively:
+\begin{equation}
+d_1 = \frac{\ln(S/K) + \left(r - q + \frac{1}{2}\sigma^2\right)\tau}{\sigma\sqrt{\tau}}, \quad d_2 = d_1 - \sigma\sqrt{\tau}.
+\end{equation}
+Put-call parity with continuous dividend yields holds identically:
+\begin{equation}
+C - P = S e^{-q\tau} - K e^{-r\tau}.
+\end{equation}
+
+\subsubsection{Analytical Greeks under Continuous Dividends}
+Using the identity $S e^{-q\tau}\phi(d_1) = K e^{-r\tau}\phi(d_2)$, the closed-form Greeks are summarised in Table~\ref{tab:bsm_greeks}.
+
+\begin{table}[htbp]
+\centering
+\large
+\caption{Analytical Greeks under the Merton Continuous Dividend Model ($\tau > 0$).}
+\label{tab:bsm_greeks}
+\begin{tabular}{l c l}
+\hline
+\textbf{Greek} & \textbf{Order} & \textbf{Closed-form Expression} \\
+\hline
+Delta (Call), $\Delta_C$ & 1st & $\frac{\partial C}{\partial S} = e^{-q\tau}\Phi(d_1)$ \\
+Delta (Put), $\Delta_P$ & 1st & $\frac{\partial P}{\partial S} = -e^{-q\tau}\Phi(-d_1)$ \\
+Vega, $\mathcal{V}$ & 1st & $\frac{\partial C}{\partial \sigma} = \frac{\partial P}{\partial \sigma} = S e^{-q\tau}\phi(d_1)\sqrt{\tau}$ \\
+Theta (Call), $\Theta_C$ & 1st & $\frac{\partial C}{\partial t} = -\frac{S e^{-q\tau}\phi(d_1)\sigma}{2\sqrt{\tau}} - r K e^{-r\tau}\Phi(d_2) + q S e^{-q\tau}\Phi(d_1)$ \\
+Theta (Put), $\Theta_P$ & 1st & $\frac{\partial P}{\partial t} = -\frac{S e^{-q\tau}\phi(d_1)\sigma}{2\sqrt{\tau}} + r K e^{-r\tau}\Phi(-d_2) - q S e^{-q\tau}\Phi(-d_1)$ \\
+Rho (Call), $\rho_C$ & 1st & $\frac{\partial C}{\partial r} = K \tau e^{-r\tau}\Phi(d_2)$ \\
+Rho (Put), $\rho_P$ & 1st & $\frac{\partial P}{\partial r} = -K \tau e^{-r\tau}\Phi(-d_2)$ \\
+Gamma, $\Gamma$ & 2nd & $\frac{\partial^2 C}{\partial S^2} = \frac{\partial^2 P}{\partial S^2} = \frac{e^{-q\tau}\phi(d_1)}{S\sigma\sqrt{\tau}}$ \\
+Vanna & 2nd & $\frac{\partial^2 V}{\partial S\partial\sigma} = -e^{-q\tau}\phi(d_1)\frac{d_2}{\sigma}$ \\
+Volga (Vomma) & 2nd & $\frac{\partial^2 V}{\partial\sigma^2} = S e^{-q\tau}\phi(d_1)\sqrt{\tau}\frac{d_1 d_2}{\sigma}$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Variance Reduction Theory: Antithetic Variates}
+
+\subsubsection{The Antithetic Covariance Theorem}
+Let $Z \sim \mathcal{N}(0, \Sigma)$ be a centered multivariate normal shock vector driving the portfolio pricing kernel $g: \mathbb{R}^N \to \mathbb{R}$. We seek to estimate $\mu := \mathbb{E}[g(Z)]$.
+
+\begin{theorem}[Antithetic Covariance Non-Positivity]
+If the valuation functional $g(z)$ is coordinate-wise monotonic (weakly increasing or weakly decreasing in each coordinate), then:
+\begin{equation}
+\operatorname{Cov}(g(Z), g(-Z)) \le 0.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Because $Z \sim \mathcal{N}(0, \Sigma)$ is symmetric about the origin, $-Z \overset{d}{=} Z$, implying $\mathbb{E}[g(-Z)] = \mathbb{E}[g(Z)] = \mu$. Define $h_1(z) := g(z)$ and $h_2(z) := g(-z)$. If $g$ is weakly increasing in each component, $h_1(z)$ is coordinate-wise increasing, whereas $h_2(z)$ is coordinate-wise decreasing because the negation flips the direction of every component. By Chebyshev's association inequality, if $h_1$ is coordinate-wise non-decreasing and $h_2$ is coordinate-wise non-increasing, then for any random vector $Z$:
+\begin{equation}
+\operatorname{Cov}(h_1(Z), h_2(Z)) \le 0 \implies \operatorname{Cov}(g(Z), g(-Z)) \le 0.
+\end{equation}
+\end{proof}
+
+\subsubsection{Variance Reduction Ratio and Asymptotic Convergence}
+For $M$ independent paired draws $(Z^{(m)}, -Z^{(m)})_{m=1}^M$, the global antithetic estimator across $2M$ total evaluations is:
+\begin{equation}
+\hat{\mu}_{\text{anti}} = \frac{1}{2M}\sum_{m=1}^M \left(g(Z^{(m)}) + g(-Z^{(m)})\right) = \frac{1}{M}\sum_{m=1}^M Y^{(m)},
+\end{equation}
+where $Y^{(m)} := \frac{1}{2}\left(g(Z^{(m)}) + g(-Z^{(m)})\right)$. The variance of $\hat{\mu}_{\text{anti}}$ satisfies:
+\begin{equation}
+\operatorname{Var}(\hat{\mu}_{\text{anti}}) = \frac{\operatorname{Var}(g(Z)) + \operatorname{Cov}(g(Z), g(-Z))}{2M} \le \frac{\operatorname{Var}(g(Z))}{2M} = \operatorname{Var}(\hat{\mu}_{\text{iid}}).
+\end{equation}
+By the Central Limit Theorem, as $M \to \infty$:
+\begin{equation}
+\sqrt{M}\left(\hat{\mu}_{\text{anti}} - \mu\right) \xrightarrow{d} \mathcal{N}\left(0, \operatorname{Var}(Y^{(1)})\right),
+\end{equation}
+preserving canonical $\mathcal{O}(M^{-1/2})$ convergence with a strictly lower standard error constant.
+
+\subsection{Coherent Tail-Risk Metrics \& Variational Optimisation}
+
+\subsubsection{Measure-Theoretic Definitions}
+Let $L := -\Delta \Pi \in L^p(\Omega, \mathcal{F}, \mathbb{P})$ ($p \ge 1$) denote the portfolio loss random variable over horizon $\Delta t$, with cumulative distribution function $F_L(l) = \mathbb{P}(L \le l)$. For confidence level $\alpha \in (0, 1)$:
+
+\begin{definition}[Value-at-Risk]
+\begin{equation}
+\operatorname{VaR}_\alpha(L) := \inf\{l \in \mathbb{R} : \mathbb{P}(L \le l) \ge \alpha\} = F_L^{-1}(\alpha).
+\end{equation}
+\end{definition}
+
+\begin{definition}[Expected Shortfall]
+For a continuous loss distribution, Expected Shortfall is defined as:
+\begin{equation}
+\operatorname{ES}_\alpha(L) := \frac{1}{1 - \alpha}\int_\alpha^1 \operatorname{VaR}_u(L)\,du = \mathbb{E}\left[L \mid L \ge \operatorname{VaR}_\alpha(L)\right].
+\end{equation}
+\end{definition}
+While $\operatorname{VaR}_\alpha$ fails the subadditivity axiom for general non-Gaussian loss distributions, $\operatorname{ES}_\alpha$ is a coherent risk measure satisfying monotonicity, subadditivity, positive homogeneity, and translation invariance.
+
+\subsubsection{The Rockafellar--Uryasev Variational Formulation}
+\begin{theorem}[Rockafellar \& Uryasev, 2000]
+Define the auxiliary convex loss objective $F_\alpha: \mathbb{R} \to \mathbb{R}$ by:
+\begin{equation}
+F_\alpha(\zeta) := \zeta + \frac{1}{1 - \alpha}\mathbb{E}\left[(L - \zeta)^+\right],
+\end{equation}
+where $(x)^+ := \max(x, 0)$. Then $F_\alpha(\zeta)$ is convex in $\zeta$, and:
+\begin{equation}
+\operatorname{ES}_\alpha(L) = \min_{\zeta \in \mathbb{R}} F_\alpha(\zeta),
+\end{equation}
+with the set of optimal minimisers containing $\zeta^* = \operatorname{VaR}_\alpha(L)$.
+\end{theorem}
+
+\begin{proof}
+\textbf{Convexity:} For every realization of $L$, the mapping $\zeta \mapsto (L - \zeta)^+$ is convex since it is the pointwise maximum of the affine functions $0$ and $L - \zeta$. Taking expectations preserves convexity, and adding the linear term $\zeta$ yields a strictly convex function $F_\alpha(\zeta)$.
+
+\textbf{First-Order Optimality:} Differentiating $F_\alpha(\zeta)$ with respect to $\zeta$ via the dominated convergence theorem:
+\begin{equation}
+F_\alpha'(\zeta) = 1 - \frac{1}{1 - \alpha}\mathbb{P}(L > \zeta).
+\end{equation}
+Setting $F_\alpha'(\zeta^*) = 0$ yields $\mathbb{P}(L > \zeta^*) = 1 - \alpha$, which defines the quantile $\zeta^* = \operatorname{VaR}_\alpha(L)$.
+
+\textbf{Minimum Value Evaluation:} Evaluating $F_\alpha$ at $\zeta^* = \operatorname{VaR}_\alpha(L)$:
+\begin{align}
+F_\alpha(\zeta^*) &= \operatorname{VaR}_\alpha(L) + \frac{1}{1 - \alpha}\mathbb{E}\left[(L - \operatorname{VaR}_\alpha(L))\mathbf{1}_{\{L \ge \operatorname{VaR}_\alpha(L)\}}\right] \nonumber \\
+&= \operatorname{VaR}_\alpha(L) + \frac{1}{1 - \alpha}\left(\mathbb{E}\left[L\mathbf{1}_{\{L \ge \operatorname{VaR}_\alpha(L)\}}\right] - \operatorname{VaR}_\alpha(L)\mathbb{P}(L \ge \operatorname{VaR}_\alpha(L))\right) \nonumber \\
+&= \operatorname{VaR}_\alpha(L) + \frac{1}{1 - \alpha}\left((1 - \alpha)\mathbb{E}\left[L \mid L \ge \operatorname{VaR}_\alpha(L)\right] - (1 - \alpha)\operatorname{VaR}_\alpha(L)\right) \nonumber \\
+&= \mathbb{E}\left[L \mid L \ge \operatorname{VaR}_\alpha(L)\right] = \operatorname{ES}_\alpha(L).
+\end{align}
+\end{proof}
+
+\section{Computational Architecture \& Algorithmic Implementation}
+
+\subsection{Modular System Architecture \& High-Performance Vectorised Pipeline}
+The Quantitative Risk Aggregator is decomposed into six modular, computational stages. Each stage consumes a strictly defined tensor contract from its predecessor and emits a validated tensor contract to its successor, enabling isolated unit-testing and component replacement without side effects. The end-to-end data pipeline proceeds as follows:
+
+\begin{enumerate}
+    \item \textbf{Ingestion \& Pre-Processing:} Raw daily closing prices for the $N$ underlying assets are mapped into a historical log-return matrix $\mathbf{R} \in \mathbb{R}^{T \times N}$, where $T$ denotes the estimation window. Concurrently, discrete interest rate benchmarks are bootstrapped into a continuous zero-rate curve $r(\tau)$, and implied volatility smiles $\sigma_i(K, \tau)$ are interpolated per asset from market option chains.
+    \item \textbf{Covariance Estimation \& Higham PSD Spectral Projection:} The empirical covariance matrix $\mathbf{\Sigma} \in \mathbb{R}^{N \times N}$ is estimated from $\mathbf{R}$. To resolve numerical indefiniteness arising from asynchronous sampling or missing data, $\mathbf{\Sigma}$ is projected onto the nearest positive semi-definite correlation matrix $\mathbf{\Sigma}_{\text{PSD}}$ via spectral eigenvalue clipping.
+    \item \textbf{Correlated Stochastic Path Generator:} A lower-triangular Cholesky factor $\mathbf{L}$ satisfying $\mathbf{\Sigma}_{\text{PSD}} = \mathbf{L}\mathbf{L}^\top$ is computed once per risk cycle. It transforms standard normal draws into correlated innovations combined with antithetic variate pairing to produce the full innovation tensor $\mathbf{Z} \in \mathbb{R}^{M \times N}$.
+    \item \textbf{Vectorised Multi-Asset Valuation Kernel:} The innovation tensor $\mathbf{Z}$ is broadcast against the initial spot vector $\mathbf{S}_0 \in \mathbb{R}^N$ to generate the terminal price surface $\mathbf{S}_T \in \mathbb{R}^{M \times N}$. Every book position is then revalued analytically via the Black--Scholes--Merton closed form, yielding the position valuation matrix $\mathbf{V} \in \mathbb{R}^{M \times K}$.
+    \item \textbf{Tail-Risk \& Coherent Metric Reduction Engine:} The simulated portfolio P\&L vector $\Delta \boldsymbol{\Pi} \in \mathbb{R}^M$ is reduced via partial introselect order statistics to compute non-parametric $\VaR_\alpha$ and $\ES_\alpha$, supplemented by Rockafellar--Uryasev linear programming for convex optimisation consistency.
+    \item \textbf{Deterministic Macro Stress \& Greek Deformation Engine:} Operating independently of the Monte Carlo path generator, the analytical valuation kernel is evaluated under deterministic multi-factor shock vectors $(\Delta \mathbf{s}_{\text{shock}}, \Delta \boldsymbol{\sigma}_{\text{shock}}, \Delta r_{\text{shock}})$ to quantify tail drawdowns and Greek deformation without resampling noise.
+\end{enumerate}
+
+\subsubsection{Vectorised Tensor Memory Layout}
+The computational performance of the engine relies on eliminating Python-level loops across paths ($M$), assets ($N$), and positions ($K$). Memory is allocated as contiguous C-ordered NumPy arrays adhering to four core tensor contracts:
+\begin{align}
+    & \mathbf{Z} \in \mathbb{R}^{M \times N} && \text{(correlated factor innovation matrix)} \\
+    & \mathbf{S}_T \in \mathbb{R}^{M \times N} && \text{(terminal underlying price surface)} \\
+    & \mathbf{V} \in \mathbb{R}^{M \times K} && \text{(revalued position valuation matrix)} \\
+    & \Delta \boldsymbol{\Pi} = \mathbf{V}\mathbf{w} - \Pi_0 \mathbf{1}_M \in \mathbb{R}^M && \text{(pathwise portfolio P\&L vector)}
+\end{align}
+
+The terminal price surface $\mathbf{S}_T$ is evaluated in a single vectorised broadcast operation:
+\begin{equation}
+    \mathbf{S}_T = \mathbf{S}_0 \odot \exp\left( \left(\mathbf{r} - \mathbf{q} - \frac{1}{2}\boldsymbol{\sigma}^2\right)T + \boldsymbol{\sigma}\sqrt{T} \odot \mathbf{Z} \right), \quad \mathbf{S}_T \in \mathbb{R}^{M \times N}
+\end{equation}
+where $\odot$ denotes elementwise (Hadamard) multiplication. The row vectors $\mathbf{S}_0, \mathbf{q}, \boldsymbol{\sigma} \in \mathbb{R}^{1 \times N}$ are broadcast across all $M$ rows of $\mathbf{Z}$ without generating intermediate memory copies.
+
+\subsubsection{Computational Complexity Analysis}
+\begin{table}[htbp]
+\centering
+\small
+\caption{Algorithmic Complexity Across Pipeline Stages ($M$ paths, $N$ underlyings, $K$ positions, $S$ stress scenarios).}
+\label{tab:complexity}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Pipeline Stage} & \textbf{Memory Complexity} & \textbf{Time (Vectorised)} & \textbf{Time (Iterative Loop)} \\
+\midrule
+Cholesky Factorisation of $\mathbf{\Sigma}_{\text{PSD}}$ & $\mathcal{O}(N^2)$ & $\mathcal{O}(N^3)$ & $\mathcal{O}(N^3)$ \\
+Innovation Generation ($\mathbf{Z} = \boldsymbol{\varepsilon}\mathbf{L}^\top$) & $\mathcal{O}(MN)$ & $\mathcal{O}(MN^2)$ & $\mathcal{O}(MN^2)$ \\
+Terminal Price Evaluation ($\mathbf{S}_T$) & $\mathcal{O}(MN)$ & $\mathcal{O}(MN)$ & $\mathcal{O}(MN)$ \\
+Multi-Instrument Revaluation ($\mathbf{V}$) & $\mathcal{O}(MK)$ & $\mathcal{O}(MK)$ & $\mathcal{O}(MK)$ \\
+Order-Statistic Quantile Extraction & $\mathcal{O}(M)$ & $\mathcal{O}(M)$ (Introselect) & $\mathcal{O}(M \log M)$ (Full Sort) \\
+Macro Stress \& Greek Deformation & $\mathcal{O}(SK)$ & $\mathcal{O}(SK)$ & $\mathcal{O}(SK)$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The dominant simulation cost is $\mathcal{O}(MN^2)$, executed once per risk cycle during the matrix transformation $\boldsymbol{\varepsilon}\mathbf{L}^\top$. Valuation is linear in the position count, $\mathcal{O}(MK)$. Because the Cholesky factor $\mathbf{L}$ is cached, updating path simulations requires only matrix-matrix multiplication without re-factorising $\mathbf{\Sigma}$.
+
+\subsection{Portfolio Specification: The ``Diversified Growth Book''}
+The reference portfolio, designated the \textit{Diversified Growth Book}, is a $K=9$ position multi-asset structure spanning $N=4$ underlyings (\texttt{AAPL}, \texttt{MSFT}, \texttt{NVDA}, \texttt{SPY}). It combines core linear equity holdings with three canonical derivative overlay structures: a long protective put (\texttt{AAPL}), a short covered call (\texttt{MSFT}), and a zero-cost collar spread (\texttt{NVDA}), with \texttt{SPY} providing benchmark equity beta and tail protection. The valuation horizon is set to $T = 1.0$ day ($\Delta t = 1/252$), with a baseline risk-free rate of $r = 4.50\%$.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Diversified Growth Book: Contract Structure, Market Inputs, and Baseline Position Parameters.}
+\label{tab:portfolio_spec}
+\begin{tabularx}{\textwidth}{c l l r r r c c c}
+\toprule
+$k$ & \textbf{Underlying} & \textbf{Instrument Type} & $w_k$ & $S_{0, i}$ (\$) & $K_k$ (\$) & $K_k / S_0$ & $\tau_k$ (yr) & $\sigma_i$ \\
+\midrule
+1 & \texttt{AAPL} & Linear Cash Equity (Long) & 150 & 195.00 & --- & --- & --- & 0.2850 \\
+2 & \texttt{AAPL} & Protective Put (Long) & 150 & 195.00 & 175.50 & 0.90 & 0.2500 & 0.2850 \\
+3 & \texttt{MSFT} & Linear Cash Equity (Long) & 200 & 428.00 & --- & --- & --- & 0.2380 \\
+4 & \texttt{MSFT} & Covered Call (Short) & -200 & 428.00 & 449.40 & 1.05 & 0.1667 & 0.2380 \\
+5 & \texttt{NVDA} & Linear Cash Equity (Long) & 300 & 118.00 & --- & --- & --- & 0.5520 \\
+6 & \texttt{NVDA} & Collar Put Leg (Long) & 300 & 118.00 & 106.20 & 0.90 & 0.3333 & 0.5520 \\
+7 & \texttt{NVDA} & Collar Call Leg (Short) & -300 & 118.00 & 135.70 & 1.15 & 0.3333 & 0.5480 \\
+8 & \texttt{SPY} & Linear Index Equity (Long) & 100 & 560.00 & --- & --- & --- & 0.1480 \\
+9 & \texttt{SPY} & Protective Put Overlay (Long) & 100 & 560.00 & 532.00 & 0.95 & 0.5000 & 0.1480 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Position sensitivities follow standard continuous-dividend Black--Scholes--Merton formulations:
+\begin{align}
+    \Delta_k &= \phi_k e^{-q_i \tau_k} \Phi(\phi_k d_1^{(k)}) \\
+    \Gamma_k &= \frac{e^{-q_i \tau_k} \phi(d_1^{(k)})}{S_{0, i}\sigma_i\sqrt{\tau_k}} \\
+    \mathcal{V}_k &= S_{0, i} e^{-q_i \tau_k} \phi(d_1^{(k)})\sqrt{\tau_k} \\
+    \Theta_k &= -\frac{S_{0, i} e^{-q_i \tau_k} \phi(d_1^{(k)})\sigma_i}{2\sqrt{\tau_k}} - \phi_k r K_k e^{-r \tau_k}\Phi(\phi_k d_2^{(k)}) + \phi_k q_i S_{0, i} e^{-q_i \tau_k}\Phi(\phi_k d_1^{(k)})
+\end{align}
+where $\phi_k = +1$ for long call / short put conventions, $\phi_k = -1$ for long put / short call conventions, and $d_1^{(k)}, d_2^{(k)}$ are evaluated at initial market parameters.
+
+\subsubsection{Aggregate Initial Valuation and Greeks}
+The baseline portfolio Net Asset Value (NAV) is evaluated as the inner product of position weights and initial market values:
+\begin{equation}
+    \Pi_0 = \sum_{k=1}^K w_k V_k(\mathbf{S}_0, \tau_k; \boldsymbol{\theta}_k) = \mathbf{w}^\top \mathbf{V}_0 = \$207,347.13
+\end{equation}
+Aggregate portfolio Greek exposure vectors are given by:
+\begin{align}
+    \Delta_{\text{port}} &= \sum_{k=1}^K w_k \Delta_k = 694.87, \quad && \Gamma_{\text{port}} = \sum_{k=1}^K w_k \Gamma_k = 0.98 \\
+    \mathcal{V}_{\text{port}} &= \sum_{k=1}^K w_k \mathcal{V}_k = 8,797.48, \quad && \Theta_{\text{port}} = \sum_{k=1}^K w_k \Theta_k = -13,891.25
+\end{align}
+The book exhibits net long directional exposure ($\Delta_{\text{port}} > 0$), positive aggregate curvature ($\Gamma_{\text{port}} > 0$), and significant positive volatility sensitivity ($\mathcal{V}_{\text{port}} > 0$), balanced by negative daily calendar carry ($\Theta_{\text{port}} < 0$).
+
+\subsection{Algorithmic Implementation: Matrix Repair \& Path Simulation}
+
+\subsubsection{Spectral Eigendecomposition and Diagonal Rescaling}
+To guarantee positive semi-definiteness prior to Cholesky decomposition, empirical correlation matrices are repaired via Algorithm~\ref{alg:higham_psd}.
+
+\begin{algorithm}[htbp]
+\caption{Higham Spectral PSD Correlation Matrix Projection}
+\label{alg:higham_psd}
+\begin{algorithmic}[1]
+\REQUIRE Symmetric empirical correlation matrix $\mathbf{\Sigma} \in \mathbb{R}^{N \times N}$, eigenvalue floor $\epsilon_{\text{floor}} > 0$ (default $10^{-8}$).
+\ENSURE Lower-triangular Cholesky factor $\mathbf{L}$ such that $\mathbf{L}\mathbf{L}^\top = \mathbf{\Sigma}_{\text{PSD}}$.
+\STATE Compute orthogonal eigendecomposition: $\mathbf{\Sigma} = \mathbf{Q} \mathbf{\Lambda} \mathbf{Q}^\top$.
+\STATE Clip eigenvalues to strictly positive floor: $\widetilde{\mathbf{\Lambda}} = \operatorname{diag}\left(\max(\lambda_1, \epsilon_{\text{floor}}), \dots, \max(\lambda_N, \epsilon_{\text{floor}})\right)$.
+\STATE Reconstruct intermediate positive-definite matrix: $\widetilde{\mathbf{\Sigma}} = \mathbf{Q} \widetilde{\mathbf{\Lambda}} \mathbf{Q}^\top$.
+\STATE Extract diagonal scaling tensor: $\mathbf{D} = \operatorname{diag}(\widetilde{\mathbf{\Sigma}})$.
+\STATE Normalise to enforce unit diagonal entries: $\mathbf{\Sigma}_{\text{PSD}} = \mathbf{D}^{-1/2} \widetilde{\mathbf{\Sigma}} \mathbf{D}^{-1/2}$.
+\STATE Compute Cholesky factorisation: $\mathbf{L} = \operatorname{cholesky}(\mathbf{\Sigma}_{\text{PSD}} + \delta \mathbf{I}_N)$.
+\RETURN $\mathbf{L}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Vectorised Antithetic Path Generation}
+Correlated Gaussian innovations are generated using Algorithm~\ref{alg:antithetic_innovations}.
+
+\begin{algorithm}[htbp]
+\caption{Correlated Antithetic Innovation Tensor Construction}
+\label{alg:antithetic_innovations}
+\begin{algorithmic}[1]
+\REQUIRE Cholesky factor $\mathbf{L} \in \mathbb{R}^{N \times N}$, total path count $M$ (even integer).
+\ENSURE Full innovation tensor $\mathbf{Z} \in \mathbb{R}^{M \times N}$ satisfying $\operatorname{Cov}(\mathbf{Z}) = \mathbf{\Sigma}_{\text{PSD}}$.
+\STATE Draw independent standard normal matrix: $\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}_N) \in \mathbb{R}^{(M/2) \times N}$.
+\STATE Inject empirical correlation structure: $\mathbf{Z}_{\text{base}} = \boldsymbol{\varepsilon} \mathbf{L}^\top \in \mathbb{R}^{(M/2) \times N}$.
+\STATE Construct antithetic reflection: $\mathbf{Z}_{\text{anti}} = -\mathbf{Z}_{\text{base}} \in \mathbb{R}^{(M/2) \times N}$.
+\STATE Stack along path dimension: $\mathbf{Z} = \begin{bmatrix} \mathbf{Z}_{\text{base}} \\ \mathbf{Z}_{\text{anti}} \end{bmatrix} \in \mathbb{R}^{M \times N}$.
+\RETURN $\mathbf{Z}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Vectorised Multi-Instrument Revaluation Kernel}
+The valuation kernel prices all $K$ positions across all $M$ simulation paths simultaneously. Let $\operatorname{und}(k) \in \{1, \dots, N\}$ denote the integer mapping from position $k$ to its underlying asset index. The multidimensional $d_1$ and $d_2$ matrices are evaluated without iteration:
+\begin{align}
+    d_1^{(m, k)} &= \frac{\ln\left(S_{\operatorname{und}(k), T}^{(m)} / K_k\right) + \left(r - q_{\operatorname{und}(k)} + \frac{1}{2}\sigma_{\operatorname{und}(k)}^2\right)\tau_k}{\sigma_{\operatorname{und}(k)}\sqrt{\tau_k}} \\
+    d_2^{(m, k)} &= d_1^{(m, k)} - \sigma_{\operatorname{und}(k)}\sqrt{\tau_k}
+\end{align}
+The position valuation matrix $\mathbf{V} \in \mathbb{R}^{M \times K}$ is populated via elementwise vector operations:
+\begin{equation}
+    V_{m, k} = \phi_k \left[ S_{\operatorname{und}(k), T}^{(m)} e^{-q_{\operatorname{und}(k)}\tau_k}\Phi(\phi_k d_1^{(m, k)}) - K_k e^{-r\tau_k}\Phi(\phi_k d_2^{(m, k)}) \right]
+\end{equation}
+Linear cash equity legs are evaluated as $V_{m, k} = S_{\operatorname{und}(k), T}^{(m)}$, dispatched via boolean masking. Terminal portfolio values and simulated loss arrays follow from matrix contraction:
+\begin{equation}
+    \boldsymbol{\Pi}_T = \mathbf{V}\mathbf{w} \in \mathbb{R}^M, \quad \mathbf{L} = -\Delta \boldsymbol{\Pi} = \Pi_0 \mathbf{1}_M - \boldsymbol{\Pi}_T \in \mathbb{R}^M
+\end{equation}
+
+\subsection{Empirical Tail-Risk Reduction \& Linear Programming Formulation}
+
+\subsubsection{Order-Statistic Quantile Identification}
+Given the empirical loss vector $\mathbf{L} \in \mathbb{R}^M$, the sample Value-at-Risk $\widehat{\VaR}_\alpha$ corresponds to the $\lceil M\alpha \rceil$-th order statistic:
+\begin{equation}
+    \widehat{\VaR}_\alpha(L) = L_{(\lceil M\alpha \rceil)}
+\end{equation}
+identified in $\mathcal{O}(M)$ average time using partial introselect (\texttt{numpy.partition}). Empirical Expected Shortfall is evaluated as the arithmetic mean of all tail losses exceeding the $\widehat{\VaR}_\alpha$ threshold:
+\begin{equation}
+    \widehat{\ES}_\alpha(L) = \frac{1}{M(1 - \alpha)} \sum_{m: L^{(m)} \ge \widehat{\VaR}_\alpha} L^{(m)}
+\end{equation}
+
+\subsubsection{Rockafellar--Uryasev Linear Programming Formulation}
+To provide exact gradient compatibility for downstream portfolio optimisation, $(\widehat{\VaR}_\alpha, \widehat{\ES}_\alpha)$ can be solved jointly via the discretised convex linear program:
+\begin{align}
+    \text{subject to} \quad & u_m \ge L^{(m)} - \zeta, \quad \forall m \in \{1, \dots, M\} \\
+    & u_m \ge 0, \quad \forall m \in \{1, \dots, M\}
+\end{align}
+At optimality, $\zeta^* = \widehat{\VaR}_\alpha$ and the objective function attains $\widehat{\ES}_\alpha$.
+
+\subsubsection{Monte Carlo Precision \& Standard Error Bounds}
+Statistical precision of the tail estimators is quantified via their asymptotic standard error bounds:
+\begin{align}
+    \operatorname{SE}(\hat{\mu}) &= \frac{s_L}{\sqrt{M}}, \quad s_L = \sqrt{\frac{1}{M-1}\sum_{m=1}^M \left(L^{(m)} - \hat{\mu}\right)^2} \\
+    \operatorname{SE}(\widehat{\ES}_\alpha) &\approx \frac{s_{\text{tail}}}{\sqrt{M(1 - \alpha)}}, \quad s_{\text{tail}} = \sqrt{\frac{1}{M_{\text{tail}}-1}\sum_{m: L^{(m)} \ge \widehat{\VaR}_\alpha} \left(L^{(m)} - \widehat{\ES}_\alpha\right)^2}
+\end{align}
+yielding empirical 95\% confidence intervals: $\operatorname{CI}_{95\%}(\widehat{\ES}_\alpha) = \left[ \widehat{\ES}_\alpha \pm 1.96 \operatorname{SE}(\widehat{\ES}_\alpha) \right]$.
+
+\subsection{Deterministic Macro Stress-Testing \& Greek Deformation Engine}
+The deterministic stress engine re-prices the analytical valuation kernel under $S$ discrete multi-factor shock scenarios $\mathcal{M}_{\text{stressed}}^{(s)} = (\mathbf{S}_{\text{stressed}}^{(s)}, \boldsymbol{\sigma}_{\text{stressed}}^{(s)}, r_{\text{stressed}}^{(s)})$ defined by joint shock triples $(\Delta \mathbf{s}_{\text{shock}}^{(s)}, \Delta \boldsymbol{\sigma}_{\text{shock}}^{(s)}, \Delta r_{\text{shock}}^{(s)})$.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Deterministic Macro Stress-Testing Scenarios Specification.}
+\label{tab:stress_scenarios_spec}
+\begin{tabularx}{\textwidth}{l c c c X}
+\toprule
+\textbf{Scenario} & $\Delta S / S_0$ & $\Delta \sigma$ & $\Delta r$ & \textbf{Macroeconomic Rationale} \\
+\midrule
+1. Moderate Equity Sell-Off & -10\% & +5 vol pts & 0 bps & Broad-based correction with mild implied volatility pop. \\
+2. Stagflation Shock & -15\% & +12 vol pts & +150 bps & Equity contraction with sticky inflation driving rates higher. \\
+3. 2008 Lehman Collapse Replay & -40\% & +35 vol pts & -150 bps & Systemic global equity crash with emergency central bank rate cuts. \\
+4. Severe Market Crash & -30\% & +30 vol pts & -100 bps & Sharp market dislocation with elevated volatility and rate cuts. \\
+5. Tech Dislocation & -25\% (Tech) & +22 vol pts & 0 bps & Idiosyncratic tech unwind (-25\%) with -10\% broad market drop. \\
+6. 2022 Fed Rate Hike Replay & -20\% & +15 vol pts & +250 bps & Rapid monetary tightening driving equity valuation de-rating. \\
+7. March 2020 COVID Shock & -34\% & +50 vol pts & -150 bps & Rapid liquidity freeze, historic VIX spike, emergency rate cuts. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{Stressed Greek Deformation Analysis}
+For each scenario $s \in \{1, \dots, S\}$, Greek deformation vectors quantify hedging drift relative to baseline market conditions $\mathcal{M}_0$:
+\begin{equation}
+    \Delta \boldsymbol{\Delta}_{\text{port}}^{(s)} = \sum_{k=1}^K w_k \left( \left.\frac{\partial V_k}{\partial S}\right|_{\mathcal{M}_{\text{stressed}}^{(s)}} - \left.\frac{\partial V_k}{\partial S}\right|_{\mathcal{M}_0} \right)
+\end{equation}
+with analogous expressions for $\Delta \mathbf{\Gamma}_{\text{port}}^{(s)}$ and $\Delta \boldsymbol{\mathcal{V}}_{\text{port}}^{(s)}$. Tracking delta drift $\Delta \boldsymbol{\Delta}_{\text{port}}^{(s)}$ identifies the degree to which baseline delta hedges destabilise under large, non-linear market dislocations.
+
+\section{Empirical Results, Tail-Risk Benchmarking \& Stress Testing}
+
+Having specified the computational architecture of the risk engine in Chapter~4---the asset-level stochastic representation, the multi-factor correlation structure, and the full-revaluation pricing kernel---this chapter presents the empirical output of a live execution of that engine against the \textit{Diversified Growth Book}. All figures reported below are the exact, unaltered outputs of a single simulation run executed on 2026-08-19, comprising $M = 100,000$ simulated paths under antithetic variance reduction.
+
+There are three primary objectives of this chapter:
+\begin{enumerate}
+    \item Establish the baseline valuation and Greek exposure profile of the portfolio.
+    \item Benchmark coherent tail-risk measures against the empirical loss distribution generated by exact pathwise revaluation.
+    \item Subject the book to a battery of deterministic macro stress scenarios that probe non-linear, multi-factor dislocations outside historical sample bounds.
+\end{enumerate}
+
+\subsection{Baseline Portfolio Valuation and Greek Exposure Analysis}
+\label{sec:ch4_baseline}
+The Diversified Growth Book carries an initial base Net Asset Value (NAV) of:
+\begin{equation}
+    \Pi_0 = \$207,347.13
+\end{equation}
+evaluated at $t = 0$ under the calibrated market state. This figure serves as the fixed denominator against which all subsequent risk metrics---Value-at-Risk, Expected Shortfall, and stress scenario drawdowns---are normalised.
+
+Table~\ref{tab:baseline_greeks} reports the baseline Greek exposure profile ($\Delta, \Gamma, \mathcal{V}, \Theta, \rho$) at the asset level and in aggregate, computed under the analytical Black--Scholes--Merton continuous-dividend formulas.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Diversified Growth Book: Asset-Level and Aggregate Portfolio Greek Exposures ($t=0$).}
+\label{tab:baseline_greeks}
+\begin{tabularx}{\textwidth}{l r r r r r}
+\toprule
+\textbf{Asset / Strategy} & \textbf{Delta ($\Delta$)} & \textbf{Gamma ($\Gamma$)} & \textbf{Vega ($\mathcal{V}$)} & \textbf{Theta ($\Theta$)} & \textbf{Rho ($\rho$)} \\
+\midrule
+\texttt{AAPL} (Linear Cash Equity) & 150.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+\texttt{MSFT} (Equity + Option Overlay) & 265.34 & 0.94 & 8,680.57 & -13,240.63 & 8,610.81 \\
+\texttt{NVDA} (Equity + Collar Overlay) & 179.53 & 0.04 & 116.91 & -650.63 & 2,433.79 \\
+\texttt{SPY} (Linear Index Baseline) & 100.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+\midrule
+\textbf{Portfolio Total} & \textbf{694.87} & \textbf{0.98} & \textbf{8,797.48} & \textbf{-13,891.25} & \textbf{11,044.61} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The Greek decomposition in Table~\ref{tab:baseline_greeks} reveals significant exposure concentration:
+\begin{itemize}
+    \item \textbf{Volatility Sensitivity ($\mathcal{V}$):} \texttt{MSFT} alone contributes $\$8,680.57$ of the portfolio's total Vega of $\$8,797.48$ ($98.67\%$). 
+    \item \textbf{Calendar Carry ($\Theta$):} \texttt{MSFT} accounts for $-\$13,240.63$ of the aggregate Theta of $-\$13,891.25$ ($95.32\%$). Because \texttt{AAPL} and \texttt{SPY} are held as linear equity positions, their second-order and volatility Greeks are identically zero by construction.
+    \item \textbf{Directional Exposure ($\Delta$):} Total Delta is $\Delta_{\text{port}} = 694.87$, confirming a net long market posture.
+    \item \textbf{Convexity ($\Gamma$):} The portfolio carries positive aggregate curvature ($\Gamma_{\text{port}} = 0.98$), driven primarily by the \texttt{MSFT} covered call structure and \texttt{NVDA} collar overlay.
+    \item \textbf{Discount Sensitivity ($\rho$):} The positive Rho of $\$11,044.61$ reflects substantial sensitivity to shifts in the risk-free rate.
+\end{itemize}
+
+\subsection{Empirical Loss Distribution and Coherent Tail-Risk Benchmarks}
+\label{sec:ch4_tailrisk}
+To capture the full non-linear return distribution, the engine generated $M = 100,000$ correlated Monte Carlo paths using Cholesky factorisation and antithetic pairing $(\mathbf{Z}, -\mathbf{Z})$. 
+
+The simulation yielded a mean P\&L of $\hat{\mu} = \$180.93$ with a Monte Carlo standard error of $\operatorname{SE}(\hat{\mu}) = \$29.7860$. Figure~\ref{fig:risk_dashboard} illustrates the four-panel risk dashboard generated by the system.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{risk_dashboard.png}
+\caption{Quantitative Risk Dashboard for the Diversified Growth Book: (Top-Left) Simulated empirical P\&L distribution with $\VaR$ and $\ES$ quantile markers; (Top-Right) Normalized Greek profile per underlying; (Bottom-Left) Monte Carlo mean P\&L convergence trace with $\pm 2\operatorname{SE}$ error envelope; (Bottom-Right) Headline portfolio risk summary.}
+\label{fig:risk_dashboard}
+\end{figure}
+
+Table~\ref{tab:tail_risk_metrics} summarises the empirical coherent tail-risk metrics extracted from the $M = 100,000$ path loss distribution.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Empirical Tail-Risk Benchmarks at Regulatory Confidence Levels ($M = 100,000$ Paths).}
+\label{tab:tail_risk_metrics}
+\begin{tabularx}{\textwidth}{l c c c}
+\toprule
+\textbf{Confidence Level ($\alpha$)} & \textbf{Value-at-Risk ($\VaR_\alpha$)} & \textbf{Expected Shortfall ($\ES_\alpha$)} & \textbf{Tail Shortfall Gap ($\ES_\alpha - \VaR_\alpha$)} \\
+\midrule
+$\alpha = 0.95$ & \$14,504.32 (6.995\% NAV) & \$17,660.34 (8.517\% NAV) & \$3,156.02 \\
+$\alpha = 0.99$ & \$19,729.75 (9.515\% NAV) & \$22,020.89 (10.620\% NAV) & \$2,291.14 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The empirical results underscore the structural difference between $\VaR$ and $\ES$:
+\begin{itemize}
+    \item At the $99\%$ confidence level, $\VaR_{0.99} = \$19,729.75$ marks the quantile boundary but is completely blind to loss severity beyond that threshold.
+    \item Expected Shortfall $\ES_{0.99} = \$22,020.89$ quantifies the conditional expectation in the terminal tail, uncovering an additional $\$2,291.14$ ($11.61\%$ increase over $\VaR$) in expected tail losses.
+    \item At the $95\%$ level, the tail shortfall gap expands to $\$3,156.02$ ($21.76\%$ increase over $\VaR$), reflecting the skewness and asymmetric dispersion introduced by the option overlays.
+\end{itemize}
+
+\subsection{Monte Carlo Estimator Convergence and Antithetic Efficiency}
+\label{sec:ch4_convergence}
+The bottom-left panel of Figure~\ref{fig:risk_dashboard} traces the cumulative sample mean $\hat{\mu}_m = \frac{1}{m}\sum_{i=1}^m \Delta \Pi^{(i)}$ bounded by the $\pm 2\operatorname{SE}(\hat{\mu}_m)$ envelope, where $\operatorname{SE}(\hat{\mu}_m) = s_L / \sqrt{m}$.
+
+The terminal standard error decays to $\operatorname{SE}(\hat{\mu}) = \$29.7860$ at $M = 100,000$ paths. The pairing of each Gaussian shock $\mathbf{Z}$ with its reflection $-\mathbf{Z}$ eliminates first-order sampling asymmetry, stabilising tail quantile extraction and accelerating convergence relative to standard pseudo-random sampling.
+
+\subsection{Deterministic Macro Stress Scenarios and Non-Linear Greek Deformation}
+\label{sec:ch4_stress}
+To assess portfolio vulnerabilities under severe multi-factor dislocations, the engine evaluated the book across seven historical and hypothetical stress scenarios.
+
+Figure~\ref{fig:stress_dashboard} presents the scenario P\&L and drawdown rankings, and Table~\ref{tab:stress_results} details the full quantitative autopsy.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{stress_test_dashboard.png}
+\caption{Deterministic Macro Stress-Testing Dashboard: (Left) Scenario P\&L impact in dollars; (Right) Percentage portfolio drawdown relative to base NAV ($\Pi_0 = \$207,347.13$).}
+\label{fig:stress_dashboard}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\footnotesize % Reduces font size slightly to fit all 6 columns cleanly
+\setlength{\tabcolsep}{3.5pt} % Tightens column padding
+\caption{Deterministic Macro Stress-Testing Results and Greek Deformation Autopsy ($\Pi_0 = \$207,347.13$).}
+\label{tab:stress_results}
+\begin{tabularx}{\textwidth}{@{} l r r r r >{\raggedright\arraybackslash}X @{}}
+\toprule
+\textbf{Scenario} & \textbf{Stressed NAV} & \textbf{Dollar P\&L} & \textbf{Drawdown} & \textbf{Delta Drift} & \textbf{Macro Narrative Description} \\
+ & (\$) & (\$) & (\%) & ($\Delta \Delta_{\text{port}}$) & \\
+\midrule
+Moderate Equity Sell-Off & 180,242.53 & -27,104.59 & -13.07\% & -67.86 & Broad equity correction with modest implied volatility pop. \\
+\addlinespace
+Stagflation Shock & 168,351.56 & -38,995.57 & -18.81\% & -102.47 & Equity sell-off accompanied by rate spikes (+150 bps) driven by sticky inflation. \\
+\addlinespace
+2008 Lehman Collapse Replay & 158,314.98 & -49,032.15 & -23.65\% & -138.99 & Global equity crash with liquidity freeze and central bank emergency rate cuts. \\
+\addlinespace
+Severe Market Crash & 157,659.49 & -49,687.63 & -23.96\% & -138.40 & Sharp equity drop accompanied by elevated volatility and rate compression. \\
+\addlinespace
+Tech Dislocation & 157,190.27 & -50,156.85 & -24.19\% & -165.68 & Concentrated tech sell-off (-25\%) with -10\% broad market decline. \\
+\addlinespace
+2022 Fed Rate Hike Replay & 156,562.82 & -50,784.31 & -24.49\% & -138.28 & Sustained valuation de-rating driven by rapid monetary tightening (+250 bps). \\
+\addlinespace
+March 2020 COVID Shock & 140,044.20 & -67,302.93 & -32.46\% & -216.99 & Acute liquidity freeze, historic VIX surge (+50 vol pts), and emergency rate cuts. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{Scenario Autopsy: March 2020 COVID Liquidity Shock}
+The March 2020 COVID Shock represents the most severe drawdown, eroding base NAV by $-\$67,302.93$ ($-32.46\%$). This loss stems from compound factor shocks:
+\begin{itemize}
+    \item Equity spot levels drop $-34\%$, triggering heavy losses on linear holdings.
+    \item Implied volatility surges by $+50$ percentage points, severely penalising the book's net short option components and driving negative Vega mark-to-market adjustments.
+    \item Emergency rate cuts compress interest rate carry on positive Rho exposures.
+\end{itemize}
+
+\subsubsection{Scenario Autopsy: Tech Dislocation}
+The Tech Dislocation scenario inflicts a $-\$50,156.85$ loss ($-24.19\%$), surpassing broader macro crashes. Because non-linear risk is concentrated in \texttt{MSFT} and \texttt{NVDA}, an idiosyncratic technology de-rating directly targets the unhedged convexity of the overlay structures.
+
+\subsubsection{Delta Drift and Dynamic Hedging Instability}
+The fifth column of Table~\ref{tab:stress_results} illustrates the breakdown of static delta hedges under stress:
+\begin{itemize}
+    \item Under the March 2020 COVID scenario, baseline Delta ($\Delta_{\text{port}} = 694.87$) collapses by $\Delta \Delta_{\text{port}} = -216.99$ (a $31.23\%$ reduction).
+    \item Under the Tech Dislocation scenario, Delta drifts by $-165.68$ ($23.84\%$).
+\end{itemize}
+This drift is the empirical manifestation of portfolio Gamma ($\Gamma_{\text{port}} = 0.98$): as underlying asset prices drop, option sensitivities shift dynamically, rendering baseline linear hedge ratios obsolete during extreme dislocations.
+
+\subsection{Comparative Synthesis: Linear Delta-Normal vs. Full-Revaluation Architecture}
+\label{sec:ch4_synthesis}
+The empirical findings demonstrate why linear factor models fail for derivative-embedded portfolios:
+\begin{enumerate}
+    \item \textbf{Delta Drift Omission:} A linear model assumes $\Delta \Pi \approx \Delta_{\text{port}} \Delta S$, treating $\Delta_{\text{port}}$ as static ($694.87$). It fails to account for the $-216.99$ delta collapse observed under severe stress.
+    \item \textbf{Zero Vega Capture:} Linear models parameterised exclusively on spot prices completely miss the volatility surface shock ($+50$ vol pts), which was a primary contributor to the COVID scenario drawdown.
+    \item \textbf{Non-Gaussian Tail Fatness:} The empirical shortfall gaps ($\$3,156.02$ at $95\%$ and $\$2,291.14$ at $99\%$) refute parametric normal assumptions, demonstrating that full-revaluation Monte Carlo is essential for capital adequacy and regulatory compliance.
+\end{enumerate}
+
+\section{Conclusion, Production Engineering \& Future Extensions}
+
+\subsection{Executive Synthesis \& Architectural Validation}
+\label{sec:ch5_synthesis}
+The preceding chapters established, from first principles, the mathematical formulation, vectorised computational architecture, and empirical validation of a full-revaluation quantitative risk management engine. By simulating terminal asset paths under a Cholesky-factorised diffusion structure $\mathbf{\Sigma}_{\text{PSD}} = \mathbf{L}\mathbf{L}^\top$ with antithetic variate pairing, and performing pathwise Black--Scholes--Merton revaluations, the system generates empirical loss distributions free from the structural deficiencies of low-order Taylor approximations.
+
+The central empirical finding of this work is the systemic failure of linear (Delta-Normal) and quadratic (Delta-Gamma) risk frameworks when evaluated under acute market dislocations. As demonstrated in Chapter~5, subjecting the \textit{Diversified Growth Book} to the March 2020 COVID Liquidity Shock produced a full-revaluation drawdown of $32.46\%$ ($-\$67,302.93$), far exceeding the loss predicted by static first-order sensitivities. This breakdown is driven by three compounding dynamics:
+\begin{enumerate}
+    \item \textbf{Delta Drift:} Non-linear option sensitivities accelerate as asset prices breach strikes, causing baseline directional exposure ($\Delta_{\text{port}} = 694.87$) to collapse by $-216.99$ points under stress.
+    \item \textbf{Orthogonal Vega Convexity:} Spot-only Taylor expansions completely miss the impact of implied volatility spikes ($+50$ vol pts), which heavily penalise short volatility overlays.
+    \item \textbf{Correlation Breakdown:} The empirical dependence structure $\mathbf{\Sigma}$ becomes heavily localised during crises, invalidating static covariance assumptions.
+\end{enumerate}
+
+These findings align directly with the post-2019 regulatory reforms under the Basel Committee on Banking Supervision (BCBS) \textit{Fundamental Review of the Trading Book} (FRTB). Within the Internal Models Approach (IMA), three architectural components implemented in this engine represent mandatory supervisory prerequisites:
+\begin{itemize}
+    \item \textbf{Coherent Expected Shortfall:} FRTB replaces $\VaR_{0.99}$ with $\ES_{0.975}$ to restore sub-additivity ($\rho(X+Y) \le \rho(X) + \rho(Y)$) and capture extreme tail fatness beyond the quantile boundary:
+    \begin{equation}
+        \ES_\alpha(L) = \mathbb{E}\left[L \mid L \ge \VaR_\alpha(L)\right]
+    \end{equation}
+    \item \textbf{Mandatory Full Revaluation:} The IMA framework disqualifies sensitivity-based proxies for books with material optionality, requiring exact repricing across all simulation scenarios.
+    \item \textbf{Robust Spectral PSD Repair:} Guaranteeing positive semi-definiteness via Higham (2002) eigenvalue projection ensures numerical stability during extreme market regimes where raw sample covariance matrices become indefinite.
+\end{itemize}
+
+\subsection{Production Architecture, HPC Scaling \& Low-Latency Execution}
+\label{sec:ch5_hpc}
+While the zero-loop vectorised NumPy pipeline guarantees $\mathcal{O}(1)$ Python overhead at $M = 10^5$ paths, institutional intraday risk management ($M \ge 10^7$ paths across enterprise books) requires migrating compute-critical kernels to a high-performance computing (HPC) substrate.
+
+\subsubsection{GPU Parallelisation and CUDA Kernels}
+The full-revaluation pipeline is embarrassingly parallel across simulation paths. An enterprise GPU deployment would:
+\begin{itemize}
+    \item Replace host pseudo-random generators with counter-based GPU algorithms (e.g., Philox4x32-10 via NVIDIA cuRAND), allowing $O(1)$ stream offsets without inter-thread dependencies.
+    \item Fuse the correlation affine transform $\mathbf{Z} = \boldsymbol{\varepsilon}\mathbf{L}^\top$, Geometric Brownian Motion diffusion, and analytical Black--Scholes--Merton pricing into unified CUDA device kernels, keeping working tensors resident in high-speed L1/shared memory.
+    \item Alleviate memory bandwidth bottlenecks: at $M \ge 10^7$, execution transitions from compute-bound floating-point operations to memory-bandwidth-bound tensor movement, where High-Bandwidth Memory (HBM) architectures deliver orders-of-magnitude throughput gains over standard host DRAM.
+\end{itemize}
+
+\subsubsection{Native Compiled Extensions: C++20, Cython, and OpenMP}
+For CPU-bound architectures, low-latency execution is achieved via natively compiled extensions:
+\begin{itemize}
+    \item \textbf{Zero-Allocation Buffer Pools:} Pre-allocating path buffers ($\mathbf{Z}$, $\mathbf{S}_T$, $\mathbf{V}$) at engine startup eliminates heap allocation overhead and garbage collection pauses.
+    \item \textbf{AVX-512 Vectorisation:} Compiling pricing routines with AVX-512 SIMD instructions processes eight double-precision lanes per cycle per core, parallelized across CPU sockets using OpenMP (\texttt{\#pragma omp parallel for}).
+    \item \textbf{C-API Interoperability:} Exposing compiled kernels via \texttt{pybind11} preserves high-level Python orchestration while running compute kernels at bare-metal speeds.
+\end{itemize}
+
+\subsubsection{Distributed Cluster Orchestration}
+At enterprise scale, risk aggregation spans multiple trading desks via distributed engines (Ray / Apache Arrow):
+\begin{itemize}
+    \item \textbf{Horizontal Netting Partitioning:} Books are sharded across compute workers, with loss arrays aggregated at the master node to evaluate unified portfolio quantiles without violating sub-additivity.
+    \item \textbf{Shared-Memory Object Stores:} Market data snapshots, yield curves, and repaired covariance matrices are materialised into shared plasma memory, enabling zero-copy access across cluster nodes.
+\end{itemize}
+
+\begin{table}[htbp]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Comparative Architectural Tiers for Enterprise-Scale Risk Engines.}
+\label{tab:hpc_tiers}
+\begin{tabularx}{\textwidth}{@{} l c l c >{\raggedright\arraybackslash}X @{}}
+\toprule
+\textbf{Architecture Tier} & \textbf{Latency} & \textbf{Memory Footprint} & \textbf{Throughput} & \textbf{Hardware Scalability} \\
+ & ($M=10^6$) & & (paths/s) & \\
+\midrule
+Single-Threaded Python & $\mathcal{O}(10^2)\text{ s}$ & Low (per-path alloc.) & $\sim 10^3 - 10^4$ & Single core; strictly serial. \\
+\addlinespace
+Vectorised NumPy & $\mathcal{O}(10^0 - 10^1)\text{ s}$ & Moderate ($M \times N$ array) & $\sim 10^5 - 10^6$ & Single node; limited by CPU memory bus. \\
+\addlinespace
+Multithreaded C++/OpenMP & $\mathcal{O}(10^{-1})\text{ s}$ & Low (pre-allocated pools) & $\sim 10^6 - 10^7$ & Scales across multi-socket CPU servers. \\
+\addlinespace
+GPU-Accelerated CUDA & $\mathcal{O}(10^{-2} - 10^{-1})\text{ s}$ & High HBM utilisation & $\sim 10^7 - 10^8$ & Scales across multi-GPU / NVLink clusters. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Advanced Quantitative Modeling Extensions}
+\label{sec:ch5_extensions}
+To extend the engine beyond Geometric Brownian Motion and constant implied volatilities, three foundational mathematical extensions are identified:
+
+\subsubsection{Stochastic Volatility: The Heston (1993) Model}
+To capture implied volatility smiles, skews, and dynamic Vega convexity, asset price dynamics can be coupled to a mean-reverting stochastic variance process $v(t)$:
+\begin{align}
+    dS(t) &= (r - q)S(t)\,dt + \sqrt{v(t)}S(t)\,dW_S^\mathbb{Q}(t) \\
+    dv(t) &= \kappa(\theta - v(t))\,dt + \xi\sqrt{v(t)}\,dW_v^\mathbb{Q}(t)
+\end{align}
+with instantaneous Brownian correlation $d\langle W_S^\mathbb{Q}, W_v^\mathbb{Q} \rangle_t = \rho_{Sv}\,dt$. Here, $\theta$ is the long-run variance, $\kappa$ is the mean-reversion rate, $\xi$ is the volatility-of-volatility, and $\rho_{Sv} < 0$ reproduces the empirical equity skew. Strict positivity of variance is guaranteed under the Feller condition $2\kappa\theta > \xi^2$.
+
+\subsubsection{Discontinuous Jump-Diffusion Dynamics}
+To incorporate overnight gap risk and discrete crash dynamics (such as the March 2020 dislocation), log-prices can be augmented with a compound Poisson jump process $J(t) = \sum_{j=1}^{N_P(t)} Y_j$:
+\begin{equation}
+    d\ln S(t) = \left(r - q - \frac{1}{2}\sigma^2 - \lambda_J k_J\right)dt + \sigma\,dW^\mathbb{Q}(t) + dJ(t)
+\end{equation}
+where $N_P(t)$ is a Poisson process with intensity $\lambda_J$, jump sizes follow $Y_j \sim \mathcal{N}(\mu_J, \sigma_J^2)$ (Merton, 1976) or an asymmetric double exponential (Kou, 2002), and $k_J = \mathbb{E}[e^Y] - 1$ preserves the risk-neutral drift compensator.
+
+\subsubsection{Multi-Curve Term Structure Modeling}
+For books containing rate derivatives, the scalar risk-free rate $r$ can be extended to dynamic short-rate processes such as the one-factor Hull--White model:
+\begin{equation}
+    dr(t) = (\eta(t) - a r(t))\,dt + \sigma_r\,dW_r^\mathbb{Q}(t)
+\end{equation}
+or a full LIBOR Market Model (LMM) simulating discrete forward rate vectors, calibrated to market interest rate swaption surfaces.
+
+\subsubsection{Multi-Period Dynamic Hedging Simulation}
+Extending the single-horizon framework to multi-step discrete rebalancing $0 = t_0 < t_1 < \dots < t_H = T$ allows explicit pathwise tracking of:
+\begin{enumerate}
+    \item Rebalancing transaction costs $\sum_{h=1}^H c_{\text{trans}} |\Delta_{\text{port}}(t_h) - \Delta_{\text{port}}(t_{h-1})| S(t_h)$.
+    \item Hedging slippage resulting from discrete rebalancing intervals.
+    \item Gamma bleed accumulated over the hedging horizon.
+\end{enumerate}
+
+\subsection{Concluding Remarks \& Institutional Risk Governance}
+\label{sec:ch5_conclusion}
+This whitepaper demonstrates that coherent, full-revaluation risk measurement is an empirical and mathematical necessity for contemporary derivatives portfolios. The severe $32.46\%$ drawdown and non-linear delta drift observed during macro stress testing confirm that linear risk models cannot reliably capture tail risk in option-embedded trading books.
+
+From an institutional governance perspective, model validation frameworks must treat risk aggregation architectures with the same mathematical rigor applied to front-office pricing models. As regulatory standards under FRTB continue to evolve, the full-revaluation, PSD-repaired Monte Carlo framework developed in this work provides a robust foundation for institutional risk measurement, capital adequacy, and dynamic risk management.
+
+\end{document}
