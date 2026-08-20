@@ -20,10 +20,11 @@ The engine executes full-revaluation Monte Carlo simulations across $M = 100,000
 * **Exact Black–Scholes–Merton Vectorized Revaluation:** Eliminates Taylor-truncation error by pricing all linear equities and European option overlays analytically across an $`(M \times K)`$ tensor layout with zero per-path Python looping.
 * **Rockafellar–Uryasev Variational Formulation:** Computes non-parametric $`\mathrm{VaR}_\alpha`$ via introselect order statistics ($`L_{(\lceil M\alpha \rceil)}`$) and solves $`\mathrm{ES}_\alpha`$ using convex optimization:
 
-  $$\min_{\zeta \in \mathbb{R}} \left\{ \zeta + \frac{1}{1-\alpha}\mathbb{E}[(L - \zeta)^+] \right\}$$
+$$
+\min_{\zeta \in \mathbb{R}} \left\lbrace \zeta + \frac{1}{1-\alpha}\mathbb{E}[(L - \zeta)^+] \right\rbrace
+$$
 
 * **Dynamic Delta Drift & Macro Stress Testing:** Quantifies non-linear Greek degradation under severe multi-factor shocks (e.g., March 2020 COVID Liquidity Shock: $-32.46\%$ drawdown, $-216.99$ Delta collapse).
-
 ---
 
 ## Visual Risk Analytics
